@@ -1,0 +1,64 @@
+# Production compose file for the Windy solar-forecast pipeline.
+#
+# Single service by design: the project is one long-running Python loop with no
+# web tier, no API and no database. Nothing is published to the network — the
+# container only makes outbound calls to windy.com.
+
+services:
+  windy-forecast:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: windy-forecast:latest
+    container_name: windy-forecast
+
+    # tini as PID 1: correct SIGTERM delivery on `docker compose down` and
+    # reaping of the Chromium/ffmpeg child processes the pipeline spawns.
+    init: true
+
+    restart: unless-stopped
+
+    env_file:
+      - .env
+
+    networks:
+      - windy-net
+
+    volumes:
+      # Windy Premium session state. Read-only: the app only reads it when the
+      # file already exists, and this prevents the container from mutating it.
+      - ./windy_login.json:/app/windy_login.json:ro
+
+      # Persistent output — kept on the host so results survive rebuilds and can
+      # be read/downloaded directly from the EC2 filesystem.
+      - ./energy_predictions:/app/energy_predictions
+      - ./features_log:/app/features_log
+      - ./models:/app/models
+      - ./accuracy_reports:/app/accuracy_reports
+      - ./windy_screenshots:/app/windy_screenshots
+      - ./windy_videos:/app/windy_videos
+
+    healthcheck:
+      test: ["CMD", "docker-healthcheck"]
+      interval: 2m
+      timeout: 15s
+      # First cycle must capture 5 layers + record a 20s animation before any
+      # CSV exists, so the container is not judged until that has had time to run.
+      start_period: 15m
+      retries: 3
+
+    # Chromium is memory-hungry; caps keep it from destabilising a small EC2 box.
+    # Raise these if you run on a larger instance.
+    mem_limit: 2g
+    cpus: 1.5
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+networks:
+  windy-net:
+    name: windy-net
+    driver: bridge

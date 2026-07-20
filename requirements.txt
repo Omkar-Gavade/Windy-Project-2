@@ -1,0 +1,17 @@
+# Runtime dependencies for the Windy solar-forecast pipeline.
+# Pinned for reproducible EC2 builds. Versions resolved and verified in the
+# python:3.12-slim-bookworm image.
+
+# --- Main loop (test_multi_image.py) ---
+playwright==1.61.0              # Windy screenshot capture + animation recording
+opencv-python-headless==5.0.0.93  # cv2 optical flow (headless: no GUI libs needed)
+numpy==2.5.1                    # array math for feature extraction
+pytesseract==0.3.13             # OCR of Windy panel values (needs tesseract-ocr binary)
+pillow==12.3.0                  # image backend required by pytesseract
+joblib==1.5.3                   # loads models/generation_model.pkl (if trained)
+
+# --- Offline training tool (train_model.py) ---
+# train_model.py prefers xgboost, then lightgbm, then falls back to
+# scikit-learn's RandomForestRegressor. Only the sklearn fallback is installed
+# here to keep the image small; add xgboost or lightgbm if you want them.
+scikit-learn==1.9.0

@@ -82,6 +82,21 @@ FORECAST_ROW_LABELS = {
     "wind": "ocr_wind_speed",
 }
 
+# Windy renders those row labels as ICONS, not text, so label matching alone
+# finds nothing. Rows are therefore also identified by the shape of their
+# values (degree signs / decimals / bare integers). A row must contain at least
+# this many same-shaped numbers before it is accepted, so one stray OCR token
+# cannot be mistaken for a whole row.
+MIN_ROW_VALUE_MATCHES = 3
+
+# Human-readable names used when warning about a row that could not be read.
+OCR_WARN_LABELS = {
+    "Temperature": "ocr_temp_c",
+    "Rain": "ocr_rain_mm",
+    "Wind": "ocr_wind_speed",
+    "Wind gusts": "ocr_wind_gusts",
+}
+
 
 def _get_roi_box(width, height, fraction=ROI_FRACTION):
     box_w = int(width * fraction)
@@ -252,6 +267,10 @@ def _extract_forecast_row_values(img) -> dict:
         })
 
     if not words:
+        print("[WARN] OCR read no text at all from the forecast panel -- "
+              "all forecast row values will be empty.")
+        for label_text, feature_name in OCR_WARN_LABELS.items():
+            print(f"[WARN] {label_text} row not detected")
         return result
 
     # ---- Group words into rows by y-coordinate (words within ~12px of
@@ -270,8 +289,19 @@ def _extract_forecast_row_values(img) -> dict:
     if current_row:
         rows.append(current_row)
 
-    # ---- For each row, check if it contains one of our known labels,
-    # then take the first number appearing AFTER the label (left to right) ----
+    # ---- Identify each row by the SHAPE OF ITS VALUES, not by a text label.
+    # Windy renders the row labels (Temperature/Rain/Wind/Gusts) as ICONS, so
+    # the old `if label in row_text_lower` check never matched and every value
+    # silently stayed None. The numbers themselves OCR fine, and each row has a
+    # distinctive value signature:
+    #     temperature -> tokens carry a degree sign:  30°  25°  24°
+    #     rain        -> decimal values:              0.01  0.05  0.11
+    #     wind/gusts  -> bare small integers:         11  3  3  4
+    # Wind and gusts share the same signature, so they are assigned in vertical
+    # order: the first integer row is wind speed, the second is gusts (this is
+    # the order Windy lays them out in the panel).
+    # Label matching is still attempted FIRST, so if a Windy build (or another
+    # UI language) does render real text labels, that still wins.
     for row in rows:
         row_sorted = sorted(row, key=lambda wd: wd["x"])
         row_text_lower = " ".join(wd["text"] for wd in row_sorted).lower()
@@ -281,14 +311,54 @@ def _extract_forecast_row_values(img) -> dict:
             if label in row_text_lower and result[feature_name] is None:
                 matched_feature = feature_name
                 break
-        if matched_feature is None:
-            continue
 
+        if matched_feature is not None:
+            for wd in row_sorted:
+                m = _NUMBER_PATTERN.fullmatch(wd["text"].replace("°", "").replace("%", ""))
+                if m:
+                    result[matched_feature] = float(m.group())
+                    break
+
+    # ---- Unit/shape-based pass for whatever the label pass could not fill ----
+    integer_rows = []
+    for row in rows:
+        row_sorted = sorted(row, key=lambda wd: wd["x"])
+
+        degree_vals, decimal_vals, integer_vals = [], [], []
         for wd in row_sorted:
-            m = _NUMBER_PATTERN.fullmatch(wd["text"].replace("°", "").replace("%", ""))
-            if m:
-                result[matched_feature] = float(m.group())
-                break
+            token = wd["text"].strip()
+            cleaned = token.replace("°", "").replace("%", "").replace(",", ".")
+            m = _NUMBER_PATTERN.fullmatch(cleaned)
+            if not m:
+                continue
+            value = float(m.group())
+            if "°" in token:
+                degree_vals.append(value)
+            elif "." in cleaned:
+                decimal_vals.append(value)
+            else:
+                integer_vals.append(value)
+
+        # Require a few same-shaped values so a stray number can't hijack a row.
+        if len(degree_vals) >= MIN_ROW_VALUE_MATCHES:
+            if result["ocr_temp_c"] is None:
+                result["ocr_temp_c"] = degree_vals[0]
+        elif len(decimal_vals) >= MIN_ROW_VALUE_MATCHES:
+            if result["ocr_rain_mm"] is None:
+                result["ocr_rain_mm"] = decimal_vals[0]
+        elif len(integer_vals) >= MIN_ROW_VALUE_MATCHES:
+            integer_rows.append((row_sorted[0]["y"], integer_vals[0]))
+
+    # Wind speed then gusts, in the order the rows appear down the panel.
+    integer_rows.sort(key=lambda item: item[0])
+    for feature_name in ("ocr_wind_speed", "ocr_wind_gusts"):
+        if result[feature_name] is None and integer_rows:
+            result[feature_name] = integer_rows.pop(0)[1]
+
+    # ---- Fail loudly: never return silently-empty OCR features ----
+    for label_text, feature_name in OCR_WARN_LABELS.items():
+        if result[feature_name] is None:
+            print(f"[WARN] {label_text} row not detected")
 
     return result
 

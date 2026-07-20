@@ -25,11 +25,28 @@ Thumbs.db
 # Logs
 *.log
 
+# Secrets / session state
+# NOTE: windy_login.json is ALREADY TRACKED in this repo and contains real
+# Windy session cookies. This entry only prevents future re-commits — see
+# DEPLOY_EC2.md ("Security") for how to untrack and rotate it.
+windy_login.json
+
 # Generated Reports
 weather_reports/
 
-# Generated Images
-windy_screenshots/
+# Generated output — directories are kept (bind-mount targets), contents ignored.
+windy_screenshots/*
+!windy_screenshots/.gitkeep
+windy_videos/*
+!windy_videos/.gitkeep
+energy_predictions/*
+!energy_predictions/.gitkeep
+features_log/*
+!features_log/.gitkeep
+models/*
+!models/.gitkeep
+accuracy_reports/*
+!accuracy_reports/.gitkeep
 
 # Build
 build/

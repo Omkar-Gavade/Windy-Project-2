@@ -76,6 +76,16 @@ FRAME_SAMPLE_STEP = 3
 # -- print a sample grayscale histogram to help pick a better threshold.
 CLOUD_BRIGHTNESS_THRESHOLD = 150
 
+# Minimum average flow magnitude (in pixels per sampled frame pair) that counts
+# as real motion rather than sub-pixel noise.
+#
+# This matters more than it looks: one pixel per sample scales up to ~1875 km/h
+# at the current zoom/sample-rate, so a meaningless 0.017px average still
+# produced "~32.8 km/h" while the direction check separately reported
+# "negligible / stationary" -- the same vector described two contradictory ways.
+# Direction AND speed now both derive from this one threshold.
+MIN_MOTION_PX = 0.05
+
 
 def _get_roi_box(width, height, fraction=ROI_FRACTION):
     """Returns (x1, y1, x2, y2) pixel coordinates for a box of the given
@@ -94,7 +104,9 @@ def _direction_from_vector(dx, dy):
     DOWNWARD, so a positive dy means motion toward the bottom of the
     frame (south) -- this is corrected for below.
     """
-    if abs(dx) < 0.05 and abs(dy) < 0.05:
+    # Use the vector's magnitude (not each axis separately) so this agrees
+    # exactly with the speed calculation in analyze_video().
+    if float(np.hypot(dx, dy)) < MIN_MOTION_PX:
         return "negligible / stationary"
 
     # Flip dy so that "up" on screen (north) is treated as positive,
@@ -191,11 +203,18 @@ def analyze_video(video_path, roi_fraction=ROI_FRACTION, sample_step=FRAME_SAMPL
     avg_direction = _direction_from_vector(avg_dx, avg_dy)
 
     pixel_speed_per_sample = float(np.hypot(avg_dx, avg_dy))
-    km_per_sample = pixel_speed_per_sample * km_per_px
-    speed_kmh = (
-        (km_per_sample / seconds_between_samples) * 3600.0
-        if seconds_between_samples > 0 else 0.0
-    )
+
+    # Sub-pixel averages are noise, not cloud movement. Report them as zero
+    # instead of amplifying them by ~1875x into a plausible-looking km/h figure
+    # that contradicts the "negligible / stationary" direction above.
+    if pixel_speed_per_sample < MIN_MOTION_PX:
+        speed_kmh = 0.0
+    else:
+        km_per_sample = pixel_speed_per_sample * km_per_px
+        speed_kmh = (
+            (km_per_sample / seconds_between_samples) * 3600.0
+            if seconds_between_samples > 0 else 0.0
+        )
 
     # ---- Cloud coverage trend (start of clip vs end of clip) ----
     coverage_start = coverage_pcts[0]

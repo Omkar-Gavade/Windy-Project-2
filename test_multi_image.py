@@ -202,10 +202,39 @@ def seek_timeline_to_one_hour_ago(page) -> bool:
     'now', and on to the forecast frames -- instead of only showing
     forecast frames starting from wherever 'now' happened to be.
     """
-    candidates_text = ["1h ago", "1 h ago", "-1h", "1hr ago"]
-    for text in candidates_text:
+    # Windy's satellite nowcast renders the time-range choices as a row of
+    # segment buttons: "24h ago" | "6h ago" | "1h ago" | "Next 1h".
+    # These are real, stable, semantic class names (not hashed), so target the
+    # segment element directly. The previous get_by_text(...).first approach
+    # resolved to an outer wrapper node that was not clickable, which is why it
+    # always fell through to the warning.
+    try:
+        # Wait for the segment row to actually exist rather than relying on the
+        # caller's fixed sleep -- on slower loads the timeline renders after it,
+        # which made this seek fail intermittently.
+        page.wait_for_selector(".radsat__segment", state="visible", timeout=15000)
+        segments = page.locator(".radsat__segment")
+        count = segments.count()
+        for i in range(count):
+            seg = segments.nth(i)
+            if seg.inner_text(timeout=2000).strip().lower() == "1h ago":
+                # force=True: the segment is visible and hit-testable, but the
+                # timeline animates continuously, so Playwright's "element is
+                # stable" actionability check never settles and the click times
+                # out. Visibility is confirmed above, so skip that check.
+                seg.scroll_into_view_if_needed(timeout=2000)
+                seg.click(timeout=3000, force=True)
+                print("  Seeked timeline back using segment button: '1h ago'")
+                page.wait_for_timeout(800)
+                return True
+    except Exception as e:
+        print(f"  [DEBUG] Segment-based timeline seek failed: {e}")
+
+    # Fallback: exact-text match anywhere on the page (covers other layers /
+    # future markup that does not use .radsat__segment).
+    for text in ["1h ago", "1 h ago", "-1h", "1hr ago"]:
         try:
-            el = page.get_by_text(text, exact=False).first
+            el = page.get_by_text(text, exact=True).first
             if el.is_visible(timeout=2000):
                 el.click(timeout=2000)
                 print(f"  Seeked timeline back using label: '{text}'")
@@ -275,6 +304,24 @@ def click_play_with_forecast(page) -> bool:
       2. If that doesn't work, look for a toggle/checkbox/switch element
          that sits immediately next to that text and click it directly.
     """
+    # Windy builds these toggles as `div.checkbox` whose ON/OFF state is carried
+    # in a `checkbox--off` / `checkbox--on` class. Read that state first: the
+    # previous version clicked unconditionally, which silently turned the toggle
+    # back OFF whenever it happened to already be ON.
+    try:
+        toggle = page.locator("div.checkbox", has_text="Play with forecast").first
+        if toggle.is_visible(timeout=3000):
+            classes = toggle.get_attribute("class") or ""
+            if "checkbox--off" not in classes:
+                print("  'Play with forecast' is already enabled -- leaving it on.")
+                return True
+            toggle.click(timeout=3000)
+            page.wait_for_timeout(500)
+            print("  Enabled 'Play with forecast' via its checkbox element.")
+            return True
+    except Exception as e:
+        print(f"  [DEBUG] Checkbox-based 'Play with forecast' toggle failed: {e}")
+
     try:
         label = page.get_by_text("Play with forecast", exact=False).first
         if label.is_visible(timeout=3000):
@@ -288,11 +335,18 @@ def click_play_with_forecast(page) -> bool:
     # Fallback: try clicking a toggle/switch/checkbox element sitting right
     # next to the label (covers the case where the label itself isn't
     # clickable and the actual switch is a separate sibling element).
+    # NOTE: the previous fallback list also tried
+    #   //*[contains(text(),'Play with forecast')]/parent::*//*[contains(@class,'switch')]
+    # and the equivalent 'toggle' variant. Those are DANGEROUS on the current
+    # Windy UI: the anchor text is no longer rendered, and the broad
+    # class-contains match can resolve to an unrelated control -- in particular
+    # the satellite display-style switch (Blue / Visible / Infra). Clicking that
+    # silently changes how the satellite imagery is coloured, which corrupts the
+    # brightness/hue features this pipeline extracts. They are removed; only the
+    # checkbox-scoped locator (the actual component type Windy uses for these
+    # toggles) is kept.
     fallback_selectors = [
-        "xpath=//*[contains(text(),'Play with forecast')]/following-sibling::*[1]",
         "xpath=//*[contains(text(),'Play with forecast')]/parent::*//*[contains(@class,'checkbox')]",
-        "xpath=//*[contains(text(),'Play with forecast')]/parent::*//*[contains(@class,'switch')]",
-        "xpath=//*[contains(text(),'Play with forecast')]/parent::*//*[contains(@class,'toggle')]",
     ]
     for sel in fallback_selectors:
         try:
@@ -305,9 +359,14 @@ def click_play_with_forecast(page) -> bool:
         except Exception:
             continue
 
-    print("  [WARN] Could not enable 'Play with forecast' automatically -- "
-          "inspect the actual toggle element (right-click -> Inspect) next "
-          "to that text and add its exact selector to click_play_with_forecast().")
+    # Verified against the live satellite nowcast page: the only toggles Windy
+    # now renders there are 'Overlay with radar', 'pressure' and
+    # 'particles animation' -- there is no 'Play with forecast' control at all.
+    # This is therefore an expected no-op on the current UI, not a broken
+    # selector. Recording still proceeds normally.
+    print("  [INFO] 'Play with forecast' control is not present in the current "
+          "Windy satellite UI -- skipping. Recording continues; the animation "
+          "plays over the nowcast range only.")
     return False
 
 
@@ -322,28 +381,32 @@ def click_slow_animation_speed(page) -> bool:
     clicks at a pixel offset to its left where the turtle (slowest, i.e.
     first/leftmost) icon sits.
     """
-    try:
-        label = page.get_by_text("Play with forecast", exact=False).first
-        box = label.bounding_box(timeout=3000)
-        if box:
-            # The 3 icons (turtle, rabbit, llama) sit just to the left of
-            # "Play with forecast", each roughly ~28-30px wide with small
-            # gaps between them. The turtle (slowest) is the FIRST/
-            # leftmost of the three, so it's roughly 2.5 icon-widths away
-            # from the left edge of the "Play with forecast" label.
-            icon_width = 30
-            turtle_x = box["x"] - (icon_width * 2.5)
-            turtle_y = box["y"] + box["height"] / 2
-
-            page.mouse.click(turtle_x, turtle_y)
-            print(f"  Clicked slow (turtle) speed icon at approx ({turtle_x:.0f}, {turtle_y:.0f}), "
-                  f"based on position relative to 'Play with forecast'.")
-            page.wait_for_timeout(500)
-            return True
-        else:
-            print("  [WARN] Could not get bounding box for 'Play with forecast' label.")
-    except Exception as e:
-        print(f"  [DEBUG] Position-based speed click failed: {e}")
+    # NOTE: the previous implementation measured the "Play with forecast" label's
+    # bounding box and then issued a raw page.mouse.click() at a computed offset
+    # to its left. That offset is not over any speed control on the current
+    # Windy UI -- it lands on the MAP itself, which can drop a pin or shift the
+    # view in the middle of a recording. It is removed rather than retuned:
+    # a blind coordinate click is worse than not setting the speed at all.
+    #
+    # Windy exposes its icon-only button groups as `.switch__item` elements
+    # inside a `.switch` container, with the container's purpose in a
+    # `data-tooltip` attribute. Try those semantic locators instead.
+    speed_group_selectors = [
+        ".switch[data-tooltip*='speed' i] .switch__item",
+        "[data-tooltip*='animation speed' i] .switch__item",
+        "#animation-speed .switch__item",
+    ]
+    for group_sel in speed_group_selectors:
+        try:
+            items = page.locator(group_sel)
+            if items.count() > 0:
+                # The slowest option is the first item in the group.
+                items.first.click(timeout=2000)
+                print(f"  Selected slowest animation speed via: {group_sel}")
+                page.wait_for_timeout(500)
+                return True
+        except Exception:
+            continue
 
     # Fallback: in case some Windy layer/version DOES expose usable
     # title/aria-label attributes on these icons.
@@ -364,8 +427,12 @@ def click_slow_animation_speed(page) -> bool:
         except Exception:
             continue
 
-    print("  [WARN] Could not select slow animation speed automatically -- "
-          "the animation will play at whatever speed is currently selected.")
+    # Verified against the live satellite nowcast page: Windy no longer exposes
+    # the turtle/rabbit/llama speed selector there, so there is nothing to
+    # click. Expected no-op on the current UI rather than a broken selector.
+    print("  [INFO] Animation speed selector is not present in the current "
+          "Windy satellite UI -- skipping. The animation plays at Windy's "
+          "default speed (recording duration is unchanged).")
     return False
 
 

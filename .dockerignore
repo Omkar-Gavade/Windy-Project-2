@@ -1,0 +1,44 @@
+# Keep the build context small and secrets out of the image.
+
+.git
+.github
+.gitignore
+
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+
+.venv/
+venv/
+env/
+
+.env
+
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+build/
+dist/
+*.egg-info/
+.ipynb_checkpoints/
+
+# Session state — mounted as a volume at runtime, never baked into the image.
+windy_login.json
+
+# Generated output — lives on host volumes, not in the image.
+windy_screenshots/
+windy_videos/
+energy_predictions/
+features_log/
+models/
+accuracy_reports/
+*.log
+
+# Docs
+DEPLOY_EC2.md
+README.md
