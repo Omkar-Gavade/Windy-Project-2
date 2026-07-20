@@ -31,6 +31,7 @@ from config import (
     VIDEO_DIR, STORAGE_STATE_PATH, SCREENSHOT_DIR, RUN_INTERVAL_SECONDS,
 )
 from run_pipeline import run_prediction_pipeline
+from batch import uploader
 
 
 def ensure_login():
@@ -605,6 +606,59 @@ def record_cloud_animation() -> Path | None:
 RUN_INTERVAL = RUN_INTERVAL_SECONDS
 
 
+def _recording_datetime_from_path(video_path) -> datetime.datetime:
+    """Recovers the moment a recording was made from its filename.
+
+    Files are named "<PLANT>_<LAYER>_<YYYY-MM-DD>_<HH-MM-SS>_clean.mp4", so the
+    timestamp is read back from there rather than using "now" (the upload runs
+    after trimming, which takes a while). Falls back to the file's mtime if the
+    name does not parse.
+    """
+    stem = Path(video_path).stem  # drops ".mp4"
+    if stem.endswith("_clean"):
+        stem = stem[: -len("_clean")]
+
+    parts = stem.split("_")
+    if len(parts) >= 2:
+        try:
+            return datetime.datetime.strptime(
+                f"{parts[-2]}_{parts[-1]}", "%Y-%m-%d_%H-%M-%S"
+            )
+        except ValueError:
+            pass
+
+    return datetime.datetime.fromtimestamp(Path(video_path).stat().st_mtime)
+
+
+def upload_recording(video_path) -> None:
+    """Step 3: send the clean MP4 to the backend.
+
+    Never raises: an upload problem (backend down, bad URL, timeout) must not
+    stop feature extraction and prediction, which work purely from local files.
+    """
+    print("\nStep 3: Uploading video...")
+
+    if video_path is None:
+        print("Upload skipped: no clean MP4 was produced by this run.")
+        return
+
+    try:
+        recording_dt = _recording_datetime_from_path(video_path)
+        result = uploader.upload_video(video_path, PLANT_NAME, recording_dt)
+    except Exception as exc:
+        # Deliberately broad: nothing about uploading may abort the pipeline.
+        print(f"Upload failed: {exc}")
+        return
+
+    # The backend replies {"success": true, "data": {... "key": "videos/..."}},
+    # so look inside "data" first and fall back to a top-level key (and finally
+    # to the whole body) if that response shape ever changes.
+    payload = result.get("data") if isinstance(result.get("data"), dict) else result
+    s3_key = payload.get("key") or payload.get("s3_key") or payload.get("Key")
+    print("Upload successful.")
+    print(f"S3 Key: {s3_key if s3_key else result}")
+
+
 def run_once():
     """Captures screenshots, records a cloud-animation video, and runs
     the LOCAL feature-extraction + ML prediction pipeline (no LLM)."""
@@ -614,7 +668,9 @@ def run_once():
     print("\nStep 2: Recording cloud movement animation...")
     video_path = record_cloud_animation()
 
-    print("\nStep 3: Running local feature-extraction + ML prediction pipeline (no LLM)...")
+    upload_recording(video_path)
+
+    print("\nStep 4: Running local feature-extraction + ML prediction pipeline (no LLM)...")
     run_prediction_pipeline(image_map, video_path)
 
 

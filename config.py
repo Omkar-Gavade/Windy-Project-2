@@ -12,6 +12,11 @@ from pathlib import Path
 
 # ---- Plant details ----
 PLANT_NAME = "SIRMOUR"
+
+# State the plant sits in. Sent as the `state` form field when uploading a
+# recording; the backend uses it to build the S3 key
+# (videos/<state>/<plant>/<date>/...). No spaces -- it becomes a path segment.
+PLANT_STATE = "MadhyaPradesh"
 PLANT_LAT = 24.56253056
 PLANT_LON = 75.09140278
 
