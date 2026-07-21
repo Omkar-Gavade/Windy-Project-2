@@ -10,9 +10,12 @@ set -euo pipefail
 
 PRED_DIR="${PRED_DIR:-/app/energy_predictions}"
 
-# Allow ~2 cycles plus margin before declaring the loop unhealthy.
-# RUN_INTERVAL_SECONDS in config.py is 1200 (20 min), so the default is 45 min.
-MAX_AGE="${HEALTH_MAX_AGE_SECONDS:-2700}"
+# The pipeline now runs at fixed daily times (CAPTURE_TIMES in config.py), so the
+# CSV is intentionally not refreshed between scheduled runs. The largest gap is
+# overnight (last run ~15:45 -> first run ~06:45, ~15h), so the age limit must
+# span that plus a run's duration or the container would look unhealthy all
+# night. Default 57600 = 16h. Lower it only if you shorten the overnight gap.
+MAX_AGE="${HEALTH_MAX_AGE_SECONDS:-57600}"
 
 # 1. The main loop process must be alive.
 pgrep -f "test_multi_image.py" >/dev/null 2>&1 \

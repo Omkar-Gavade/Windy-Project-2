@@ -28,7 +28,7 @@ from playwright.sync_api import sync_playwright
 from config import (
     PLANT_NAME, PLANT_LAT, PLANT_LON, ZOOM_LEVEL, VIEWPORT_WIDTH, VIEWPORT_HEIGHT,
     LAYERS, RECORD_ANIMATION_VIDEO, ANIMATION_LAYER, ANIMATION_RECORD_SECONDS,
-    VIDEO_DIR, STORAGE_STATE_PATH, SCREENSHOT_DIR, RUN_INTERVAL_SECONDS,
+    VIDEO_DIR, STORAGE_STATE_PATH, SCREENSHOT_DIR, CAPTURE_TIMES,
 )
 from run_pipeline import run_prediction_pipeline
 from batch import uploader
@@ -603,7 +603,35 @@ def record_cloud_animation() -> Path | None:
         return full_path
 
 
-RUN_INTERVAL = RUN_INTERVAL_SECONDS
+def _parse_capture_times():
+    """Turns config.CAPTURE_TIMES ("HH:MM" strings) into a sorted, de-duplicated
+    list of datetime.time objects. Sorting here means the list in config.py does
+    not have to be maintained in order by hand, and de-duplication guarantees a
+    given clock time can never be scheduled (and therefore fired) twice."""
+    unique = {}
+    for raw in CAPTURE_TIMES:
+        t = datetime.datetime.strptime(raw.strip(), "%H:%M").time()
+        unique[(t.hour, t.minute)] = t
+    return sorted(unique.values())
+
+
+def _next_capture_datetime(now):
+    """Returns the next capture moment strictly AFTER `now`.
+
+    Walks today's scheduled times in order and returns the first one still in
+    the future; if every time today has already passed, returns the first time
+    tomorrow. The strict "after now" comparison is what makes the scheduler
+    correct on every requirement: it never fires immediately on startup, it
+    always waits for the next upcoming slot after a (re)start, and because the
+    clock is already past a slot once its run finishes, the same slot can never
+    fire twice."""
+    times = _parse_capture_times()
+    today = now.date()
+    for t in times:
+        candidate = datetime.datetime.combine(today, t)
+        if candidate > now:
+            return candidate
+    return datetime.datetime.combine(today + datetime.timedelta(days=1), times[0])
 
 
 def _recording_datetime_from_path(video_path) -> datetime.datetime:
@@ -677,9 +705,33 @@ def run_once():
 def main():
     ensure_login()
 
+    scheduled = ", ".join(t.strftime("%H:%M") for t in _parse_capture_times())
+    print(f"\nCapture schedule (server local time): {scheduled}")
+    print("The pipeline runs once at each of these times and at no other time.")
+
     run_count = 0
 
     while True:
+        # Recomputed every iteration from the current wall clock, so a restart
+        # (or the run we just finished) always rolls forward to the next slot.
+        next_run = _next_capture_datetime(datetime.datetime.now())
+        print(
+            f"\nWaiting for next scheduled capture at "
+            f"{next_run.strftime('%Y-%m-%d %H:%M:%S')}."
+        )
+        print("(Press Ctrl+C to stop the script.)")
+
+        # Sleep in bounded chunks rather than one multi-hour sleep so a system
+        # clock adjustment (NTP correction, TZ/DST change) is noticed promptly.
+        # We only leave this loop once the wall clock has actually reached
+        # next_run, which guarantees the pipeline never fires early or on
+        # startup.
+        while True:
+            remaining = (next_run - datetime.datetime.now()).total_seconds()
+            if remaining <= 0:
+                break
+            time.sleep(min(remaining, 300))
+
         run_count += 1
         start_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         print("\n" + "#" * 60)
@@ -690,13 +742,6 @@ def main():
             run_once()
         except Exception as e:
             print(f"\n[ERROR] Run {run_count} failed: {e}")
-
-        next_run_time = (
-            datetime.datetime.now() + datetime.timedelta(seconds=RUN_INTERVAL)
-        ).strftime("%Y-%m-%d %H:%M:%S")
-        print(f"\nWaiting {RUN_INTERVAL // 60} minutes... next run at approximately {next_run_time}")
-        print("(Press Ctrl+C to stop the script.)")
-        time.sleep(RUN_INTERVAL)
 
 
 if __name__ == "__main__":

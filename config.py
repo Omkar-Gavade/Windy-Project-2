@@ -50,7 +50,27 @@ ANIMATION_RECORD_SECONDS = 20
 # ---- Forecast settings ----
 NUM_FORECAST_BLOCKS = 8       # 8 x 15 min = next 2 hours
 BLOCK_MINUTES = 15
-RUN_INTERVAL_SECONDS = 20 * 60
+
+# ---- Capture schedule ----
+# The automation captures EXACTLY ONCE at each of these local wall-clock times
+# every day, and at no other time. "Local" means the container's timezone --
+# set TZ in .env (e.g. Asia/Kolkata). Times are "HH:MM" on a 24-hour clock.
+#
+# Behaviour guaranteed by the scheduler in test_multi_image.py:
+#   - never captures immediately on startup,
+#   - if started/restarted after a time has passed, it simply waits for the
+#     next upcoming time in this list,
+#   - each time fires once, with no duplicates.
+# The list does not need to be pre-sorted; the scheduler sorts and de-duplicates.
+CAPTURE_TIMES = [
+    "06:45",
+    "08:15",
+    "09:45",
+    "11:15",
+    "12:45",
+    "14:15",
+    "15:45",
+]
 
 # ---- Paths ----
 STORAGE_STATE_PATH = Path("windy_login.json")

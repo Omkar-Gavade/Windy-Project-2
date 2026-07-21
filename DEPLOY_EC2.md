@@ -19,7 +19,8 @@ A **single long-running Python process**. It is not a web application:
 
 ```
                   ┌──────────────────────────────────────────┐
-                  │  loop every RUN_INTERVAL_SECONDS (20 min) │
+                  │  run once at each fixed daily time in     │
+                  │  CAPTURE_TIMES (config.py, server local)  │
                   └──────────────────────────────────────────┘
                                      │
    1. Playwright + Chromium ─────────┤ log in via windy_login.json (session reuse)
@@ -108,7 +109,7 @@ in `config.py`; Windy access comes from the mounted session file.
 | Variable | Default | Consumed by | Why it matters |
 |---|---|---|---|
 | `TZ` | `Asia/Kolkata` | container OS | **Correctness-critical.** Forecast blocks come from local wall-clock `datetime.now()`. A fresh EC2 is UTC, which would shift every 15-minute block and misalign the solar-elevation model. Set to the plant's real timezone. |
-| `HEALTH_MAX_AGE_SECONDS` | `2700` | healthcheck | Max age of the predictions CSV before the container is marked unhealthy (~2 cycles). Raise if you increase `RUN_INTERVAL_SECONDS`. |
+| `HEALTH_MAX_AGE_SECONDS` | `57600` | healthcheck | Max age of the predictions CSV before the container is marked unhealthy. Captures run at fixed daily times (`CAPTURE_TIMES` in `config.py`), so the default (16h) spans the overnight gap between the last and first scheduled run. Lower it only if you shorten that gap. |
 
 ---
 

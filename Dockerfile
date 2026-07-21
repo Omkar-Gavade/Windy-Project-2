@@ -2,7 +2,8 @@
 #
 # The application is a single long-running Python loop (test_multi_image.py):
 #   capture Windy screenshots + animation -> OCR/colour features + optical flow
-#   -> ML/physics forecast -> CSV output, repeating every RUN_INTERVAL_SECONDS.
+#   -> ML/physics forecast -> CSV output, once at each of the fixed daily times
+#   in CAPTURE_TIMES (config.py).
 # There is no web server, no database and no exposed port.
 #
 # Pinned to bookworm (Debian 12) for a stable Playwright/Chromium dependency set.
