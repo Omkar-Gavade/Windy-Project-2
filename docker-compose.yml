@@ -40,11 +40,11 @@ services:
 
     healthcheck:
       test: ["CMD", "docker-healthcheck"]
-      interval: 2m
-      timeout: 15s
-      # First cycle must capture 5 layers + record a 20s animation before any
-      # CSV exists, so the container is not judged until that has had time to run.
-      start_period: 15m
+      interval: 1m
+      timeout: 10s
+      # The loop writes /app/.heartbeat within seconds of startup, so health can
+      # be judged quickly -- no need to wait for a full capture cycle.
+      start_period: 90s
       retries: 3
 
     # Chromium is memory-hungry; caps keep it from destabilising a small EC2 box.

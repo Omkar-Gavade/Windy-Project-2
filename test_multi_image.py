@@ -22,6 +22,7 @@ Run:
 import time
 import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from playwright.sync_api import sync_playwright
 
@@ -29,9 +30,12 @@ from config import (
     PLANT_NAME, PLANT_LAT, PLANT_LON, ZOOM_LEVEL, VIEWPORT_WIDTH, VIEWPORT_HEIGHT,
     LAYERS, RECORD_ANIMATION_VIDEO, ANIMATION_LAYER, ANIMATION_RECORD_SECONDS,
     VIDEO_DIR, STORAGE_STATE_PATH, SCREENSHOT_DIR, RUN_INTERVAL_SECONDS,
+    POST_PLAY_CAPTURE_SECONDS, RECORD_MAX_ATTEMPTS, TIMEZONE, CAPTURE_TIMES,
+    HEARTBEAT_PATH,
 )
 from run_pipeline import run_prediction_pipeline
 from batch import uploader
+from batch import video_validation
 
 
 def ensure_login():
@@ -456,151 +460,203 @@ def click_plant_marker(page):
         print(f"  [WARN] Could not click map to place pointer: {e}")
 
 
-def record_cloud_animation() -> Path | None:
-    """
-    Records a short video of the animated Clouds layer (time-lapse cloud
-    movement) around the plant, using Playwright's built-in video
-    recording. Returns the path to the saved video, or None if recording
-    failed.
+def _capture_full_session() -> Path | None:
+    """Runs one full browser lifecycle and returns the raw recorded .webm.
 
-    This uses a SEPARATE browser context from capture_all_layers() because
-    Playwright only starts recording once a context is created with
-    record_video_dir set, and only finalizes/saves the file once that
-    context is closed.
+    Every Playwright resource created here (browser, context, page) is released
+    in a finally block before returning -- even on error -- so no context, page
+    or Chromium process is ever leaked between runs.
     """
-    if not RECORD_ANIMATION_VIDEO:
+    DEDICATED_NOWCAST_URLS = {
+        # Satellite only gets a real animated timeline + play button on Windy's
+        # DEDICATED nowcast page; the generic "/{lat}/{lon}?..." URL opens a
+        # static forecast page with no play button.
+        "satellite": "https://www.windy.com/-Satellite-satellite?satellite,{lat},{lon},{zoom},p:cities",
+    }
+    if ANIMATION_LAYER in DEDICATED_NOWCAST_URLS:
+        url = DEDICATED_NOWCAST_URLS[ANIMATION_LAYER].format(
+            lat=PLANT_LAT, lon=PLANT_LON, zoom=ZOOM_LEVEL
+        )
+    else:
+        url = (
+            f"https://www.windy.com/{PLANT_LAT}/{PLANT_LON}"
+            f"?{ANIMATION_LAYER},{PLANT_LAT},{PLANT_LON},{ZOOM_LEVEL},p:cities"
+        )
+
+    browser = context = page = video_obj = None
+    raw_path_str = None
+    with sync_playwright() as p:
+        try:
+            browser = p.chromium.launch(headless=True)
+            context = browser.new_context(
+                storage_state=str(STORAGE_STATE_PATH),
+                viewport={"width": VIEWPORT_WIDTH, "height": VIEWPORT_HEIGHT},
+                record_video_dir=str(VIDEO_DIR),
+                record_video_size={"width": VIEWPORT_WIDTH, "height": VIEWPORT_HEIGHT},
+            )
+            # Cap every operation so a hung page can never wedge the run forever.
+            context.set_default_timeout(60000)
+            context.set_default_navigation_timeout(60000)
+            page = context.new_page()
+
+            page.goto(url, wait_until="domcontentloaded", timeout=60000)
+
+            # Let map tiles + timeline frames load before pressing play.
+            page.wait_for_timeout(15000)
+            dismiss_popups(page)
+            page.wait_for_timeout(1500)
+
+            dismiss_timeline_overlay(page)
+            seek_timeline_to_one_hour_ago(page)
+
+            # Marker BEFORE play so the click is not injected into the captured
+            # animation window (it drops a pin; harmless, but keeping it out of
+            # the recording keeps the motion check clean).
+            click_plant_marker(page)
+
+            click_play_button(page)
+            click_slow_animation_speed(page)
+            click_play_with_forecast(page)
+
+            # Keep recording long enough that the moving animation is guaranteed
+            # to be somewhere in the clip. Windy's nowcast buffers for a long,
+            # variable time after play before it actually animates, so we record
+            # generously and pick the moving window afterwards (see
+            # _trim_to_motion) instead of trusting a fixed offset.
+            print(f"  Capturing {POST_PLAY_CAPTURE_SECONDS}s of animation "
+                  f"(moving window is selected afterwards)...")
+            # Use time.sleep, NOT page.wait_for_timeout, for the long capture:
+            # a multi-tens-of-seconds driver-side wait trips Playwright with
+            # "Event loop is closed". time.sleep blocks Python while the browser
+            # keeps recording untouched -- the approach the original used.
+            time.sleep(POST_PLAY_CAPTURE_SECONDS)
+
+            video_obj = page.video
+        finally:
+            # Order matters: close context first (finalizes the video file),
+            # then the browser. Guarded so a failure in one still attempts the
+            # other -- no leaked Chromium.
+            if context is not None:
+                try:
+                    context.close()
+                except Exception as exc:
+                    print(f"  [WARN] context.close() failed: {exc}")
+            if browser is not None:
+                try:
+                    browser.close()
+                except Exception as exc:
+                    print(f"  [WARN] browser.close() failed: {exc}")
+
+        # video_obj.path() must be read while Playwright is still running (i.e.
+        # still inside this `with sync_playwright()` block); calling it after the
+        # block exits raises "Event loop is closed". The video file is already
+        # finalized by context.close() above.
+        raw_path_str = video_obj.path() if video_obj is not None else None
+
+    if raw_path_str is None:
         return None
 
-    print(f"\nRecording {ANIMATION_RECORD_SECONDS}s of the '{ANIMATION_LAYER}' animation...")
-
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        context = browser.new_context(
-            storage_state=str(STORAGE_STATE_PATH),
-            viewport={"width": VIEWPORT_WIDTH, "height": VIEWPORT_HEIGHT},
-            record_video_dir=str(VIDEO_DIR),
-            record_video_size={"width": VIEWPORT_WIDTH, "height": VIEWPORT_HEIGHT},
-        )
-        page = context.new_page()
-
-        # IMPORTANT: some layers (e.g. Satellite) only get a real
-        # animated timeline + play button on Windy's DEDICATED nowcast
-        # page (URL pattern "/-<Layer>-<layer>?..."). The generic
-        # "/{lat}/{lon}?{layer},..." URL used for screenshots instead opens
-        # the normal static forecast page for that layer, which has no
-        # play button at all -- that was why the recording stayed static.
-        DEDICATED_NOWCAST_URLS = {
-            "satellite": "https://www.windy.com/-Satellite-satellite?satellite,{lat},{lon},{zoom},p:cities",
-        }
-
-        if ANIMATION_LAYER in DEDICATED_NOWCAST_URLS:
-            url = DEDICATED_NOWCAST_URLS[ANIMATION_LAYER].format(
-                lat=PLANT_LAT, lon=PLANT_LON, zoom=ZOOM_LEVEL
-            )
-        else:
-            url = (
-                f"https://www.windy.com/{PLANT_LAT}/{PLANT_LON}"
-                f"?{ANIMATION_LAYER},{PLANT_LAT},{PLANT_LON},{ZOOM_LEVEL},p:cities"
-            )
-        page.goto(url, wait_until="domcontentloaded", timeout=60000)
-        record_start_time = time.time()  # marks when this browser session actually started
-
-        # Wait long enough for the map tiles AND the timeline/animation
-        # frames to fully load before we click play. Clicking play too
-        # early (while frames are still loading) causes the animation to
-        # already be partway through by the time it's actually playing
-        # smoothly -- this longer wait fixes that.
-        page.wait_for_timeout(15000)
-        dismiss_popups(page)
-        page.wait_for_timeout(1500)
-
-        # Step 1: close any overlay/info box (e.g. the white timeline info
-        # box that the Satellite layer shows) that may be sitting on top
-        # of, or hiding, the play button.
-        dismiss_timeline_overlay(page)
-
-        # Step 1b: seek the playhead back to "1h ago" BEFORE pressing play,
-        # so the recorded animation covers roughly the last hour through
-        # to the next hour, instead of starting from "now" onward only.
-        seek_timeline_to_one_hour_ago(page)
-
-        # Step 2: click the play button to start the time-lapse animation.
-        click_play_button(page)
-
-        # Capture the time right after Play was clicked -- this is the
-        # point the trimmed clean video should start from, regardless of
-        # how long the steps below (speed, play-with-forecast, marker,
-        # warm-up) take.
-        play_click_time = time.time()
-
-        # Step 2b: select the slowest playback speed so the recorded clip
-        # plays back smoothly instead of jumping through frames too fast.
-        click_slow_animation_speed(page)
-
-        # Step 2c: also enable "Play with forecast" so the animation
-        # continues seamlessly from the nowcast into the forecast frames.
-        click_play_with_forecast(page)
-
-        # Step 3: click on the map at the plant's coordinates once, so a
-        # pointer/marker is dropped there for the recording.
-        click_plant_marker(page)
-
-        # Extra warm-up buffer so Windy has time to actually fetch/cache
-        # the animation frames before we finish this recording session.
-        CACHE_WARMUP_SECONDS = 6
-        page.wait_for_timeout(CACHE_WARMUP_SECONDS * 1000)
-
-        # skip_seconds is now a FIXED 24 seconds -- the trimmed clean
-        # video always starts 24s into the full recording.
-        skip_seconds = 24
-        print(f"  Trimming at a fixed {skip_seconds}s into the recording -- "
-              f"keeping the next {ANIMATION_RECORD_SECONDS}s as the clean clip.")
-
-        time.sleep(ANIMATION_RECORD_SECONDS)
-
-        video_obj = page.video
-        context.close()  # finalizes and writes the video file
-        browser.close()
-
-        if video_obj is None:
-            return None
-
-        raw_path = Path(video_obj.path())
-
-    # Rename from Playwright's random hash filename to something readable
+    raw_path = Path(raw_path_str)
     timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     full_path = VIDEO_DIR / f"{PLANT_NAME}_{ANIMATION_LAYER}_{timestamp}_full.webm"
     try:
         raw_path.rename(full_path)
     except Exception:
-        full_path = raw_path  # fall back to the original name if rename fails
-
+        full_path = raw_path
     print(f"  [OK] Full video saved: {full_path.resolve()}")
+    return full_path
 
-    # Trim starting right after the Play click, keeping the next
-    # ANIMATION_RECORD_SECONDS as the clean clip. Requires ffmpeg to be
-    # installed and on PATH -- if it isn't, we fall back to using the full
-    # (untrimmed) video instead.
-    clean_path = VIDEO_DIR / f"{PLANT_NAME}_{ANIMATION_LAYER}_{timestamp}_clean.mp4"
+
+def _trim_to_motion(full_path: Path) -> Path | None:
+    """Trims the ANIMATION_RECORD_SECONDS window with the MOST motion out of the
+    full recording (not a fixed offset), so the clean clip contains the actual
+    moving animation rather than the frozen warm-up. Returns the clean mp4 path,
+    or None if ffmpeg is unavailable.
+    """
+    start, mean_diff = video_validation.best_motion_window(
+        full_path, ANIMATION_RECORD_SECONDS
+    )
+    print(f"  Most-motion window starts at {start}s "
+          f"(mean inter-frame diff {mean_diff:.3f}); trimming "
+          f"{ANIMATION_RECORD_SECONDS}s from there.")
+
+    clean_path = full_path.with_name(full_path.name.replace("_full.webm", "_clean.mp4"))
     try:
         import subprocess
         subprocess.run(
             [
                 "ffmpeg", "-y",
+                "-ss", str(start),
                 "-i", str(full_path),
-                "-ss", str(skip_seconds),
                 "-t", str(ANIMATION_RECORD_SECONDS),
                 str(clean_path),
             ],
             check=True,
             capture_output=True,
         )
-        print(f"  [OK] Clean trimmed clip saved: {clean_path.resolve()}")
-        return clean_path
     except Exception as e:
-        print(f"  [WARN] Could not trim video with ffmpeg ({e}). "
-              f"Falling back to the full untrimmed video.")
-        return full_path
+        print(f"  [WARN] Could not trim video with ffmpeg ({e}).")
+        return None
+
+    print(f"  [OK] Clean trimmed clip saved: {clean_path.resolve()}")
+    return clean_path
+
+
+def record_cloud_animation() -> Path | None:
+    """
+    Records the animated satellite layer around the plant and returns the path
+    to a clean mp4 that is VERIFIED to contain a moving animation -- or None if
+    every attempt failed.
+
+    Reliability contract (do not weaken):
+      * Each attempt is a full, isolated browser lifecycle with guaranteed
+        cleanup (_capture_full_session).
+      * The clip is trimmed to the actually-moving window, then checked with
+        video_validation.is_moving. A frozen clip is never returned.
+      * Up to RECORD_MAX_ATTEMPTS tries; if none move, returns None so the
+        caller fails the run and uploads nothing.
+    """
+    if not RECORD_ANIMATION_VIDEO:
+        return None
+
+    print(f"\nRecording the '{ANIMATION_LAYER}' animation "
+          f"(want {ANIMATION_RECORD_SECONDS}s of real motion)...")
+
+    for attempt in range(1, RECORD_MAX_ATTEMPTS + 1):
+        print(f"\n  --- Recording attempt {attempt}/{RECORD_MAX_ATTEMPTS} ---")
+        try:
+            full_path = _capture_full_session()
+        except Exception as exc:
+            print(f"  [WARN] Recording attempt {attempt} raised: {exc}")
+            continue
+
+        if full_path is None:
+            print(f"  [WARN] Attempt {attempt} produced no video file.")
+            continue
+
+        clean_path = _trim_to_motion(full_path)
+        if clean_path is None:
+            continue
+
+        moving, mean_diff, moving_frac = video_validation.is_moving(
+            clean_path, ANIMATION_RECORD_SECONDS
+        )
+        if moving:
+            print(f"  [OK] Motion verified (mean diff {mean_diff:.3f}, "
+                  f"{moving_frac*100:.0f}% of seconds moving). Accepting clip.")
+            return clean_path
+
+        print(f"  [WARN] Attempt {attempt} clip is frozen/static "
+              f"(mean diff {mean_diff:.3f}, only {moving_frac*100:.0f}% moving) "
+              f"-- discarding and retrying.")
+        try:
+            clean_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+    print(f"  [ERROR] Recording failed after {RECORD_MAX_ATTEMPTS} attempts -- "
+          f"no moving animation captured. This run will NOT upload a video.")
+    return None
 
 
 RUN_INTERVAL = RUN_INTERVAL_SECONDS
@@ -642,6 +698,16 @@ def upload_recording(video_path) -> None:
         print("Upload skipped: no clean MP4 was produced by this run.")
         return
 
+    # Final gate before the network call: never upload a corrupt or wrong-length
+    # recording. (Motion was already verified inside record_cloud_animation;
+    # this re-checks file integrity and duration as defence in depth.)
+    playable, reason = video_validation.validate_playable(
+        video_path, ANIMATION_RECORD_SECONDS
+    )
+    if not playable:
+        print(f"Upload skipped: recording failed validation ({reason}).")
+        return
+
     try:
         recording_dt = _recording_datetime_from_path(video_path)
         result = uploader.upload_video(video_path, PLANT_NAME, recording_dt)
@@ -664,39 +730,114 @@ def run_once():
     the LOCAL feature-extraction + ML prediction pipeline (no LLM)."""
     print("Step 1: Capturing screenshots (satellite + wind + solarpower + clouds + rain)...\n")
     image_map = capture_all_layers()
+    _touch_heartbeat()
 
     print("\nStep 2: Recording cloud movement animation...")
     video_path = record_cloud_animation()
+    _touch_heartbeat()
 
     upload_recording(video_path)
+    _touch_heartbeat()
 
     print("\nStep 4: Running local feature-extraction + ML prediction pipeline (no LLM)...")
     run_prediction_pipeline(image_map, video_path)
+    _touch_heartbeat()
+
+
+# ---------------------------------------------------------------------
+# Fixed-time scheduler (Asia/Kolkata) -- no cron, no external scheduler.
+# ---------------------------------------------------------------------
+
+_TZ = ZoneInfo(TIMEZONE)
+
+# How often the loop wakes while waiting: refreshes the liveness heartbeat and
+# keeps SIGTERM shutdown responsive even across the long overnight gap.
+HEARTBEAT_INTERVAL_SECONDS = 60
+
+
+def _now() -> datetime.datetime:
+    return datetime.datetime.now(_TZ)
+
+
+def _touch_heartbeat() -> None:
+    """Refreshes the heartbeat file the Docker healthcheck watches. Best-effort;
+    a write failure must never crash the loop."""
+    try:
+        HEARTBEAT_PATH.write_text(_now().isoformat(), encoding="utf-8")
+    except Exception as exc:
+        print(f"[WARN] could not update heartbeat: {exc}")
+
+
+def next_capture_datetime(now: datetime.datetime) -> datetime.datetime:
+    """Returns the next scheduled capture time strictly after `now`.
+
+    Computed purely from the wall-clock schedule (today, else tomorrow's first
+    slot), so it never drifts with processing time and a scheduled slot missed
+    because a previous run overran is simply skipped -- captures only ever
+    happen at CAPTURE_TIMES.
+    """
+    for day_offset in (0, 1):
+        day = (now + datetime.timedelta(days=day_offset)).date()
+        for hour, minute in sorted(CAPTURE_TIMES):
+            candidate = datetime.datetime.combine(
+                day, datetime.time(hour, minute)
+            ).replace(tzinfo=_TZ)
+            if candidate > now:
+                return candidate
+    # CAPTURE_TIMES is non-empty, so this is unreachable.
+    raise RuntimeError("no capture times configured")
+
+
+def _is_scheduled_now(now: datetime.datetime) -> bool:
+    """True if `now` falls exactly on a scheduled minute (startup fast-path)."""
+    return (now.hour, now.minute) in CAPTURE_TIMES
+
+
+def _sleep_until(target: datetime.datetime) -> None:
+    """Sleeps until `target`, waking every HEARTBEAT_INTERVAL_SECONDS to refresh
+    the heartbeat (so health stays green through long waits)."""
+    while True:
+        remaining = (target - _now()).total_seconds()
+        if remaining <= 0:
+            return
+        _touch_heartbeat()
+        time.sleep(min(remaining, HEARTBEAT_INTERVAL_SECONDS))
+
+
+def _do_run(run_count: int) -> None:
+    start = _now().strftime("%Y-%m-%d %H:%M:%S %Z")
+    print("\n" + "#" * 60)
+    print(f"# RUN {run_count} -- started at {start}")
+    print("#" * 60)
+    _touch_heartbeat()
+    try:
+        run_once()
+    except Exception as e:
+        print(f"\n[ERROR] Run {run_count} failed: {e}")
+    _touch_heartbeat()
 
 
 def main():
     ensure_login()
+    _touch_heartbeat()
+
+    schedule = ", ".join(f"{h:02d}:{m:02d}" for h, m in sorted(CAPTURE_TIMES))
+    print(f"Scheduler active ({TIMEZONE}). Capture times: {schedule}")
 
     run_count = 0
 
-    while True:
+    # Starting exactly on a scheduled minute runs immediately.
+    if _is_scheduled_now(_now()):
         run_count += 1
-        start_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        print("\n" + "#" * 60)
-        print(f"# RUN {run_count} -- started at {start_time}")
-        print("#" * 60)
+        _do_run(run_count)
 
-        try:
-            run_once()
-        except Exception as e:
-            print(f"\n[ERROR] Run {run_count} failed: {e}")
-
-        next_run_time = (
-            datetime.datetime.now() + datetime.timedelta(seconds=RUN_INTERVAL)
-        ).strftime("%Y-%m-%d %H:%M:%S")
-        print(f"\nWaiting {RUN_INTERVAL // 60} minutes... next run at approximately {next_run_time}")
-        print("(Press Ctrl+C to stop the script.)")
-        time.sleep(RUN_INTERVAL)
+    while True:
+        target = next_capture_datetime(_now())
+        print(f"\nNext capture scheduled for {target.strftime('%Y-%m-%d %H:%M:%S %Z')} "
+              f"(waiting; Ctrl+C to stop).")
+        _sleep_until(target)
+        run_count += 1
+        _do_run(run_count)
 
 
 if __name__ == "__main__":

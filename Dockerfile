@@ -56,9 +56,10 @@ RUN groupadd --gid "${APP_GID}" appuser \
     && chown -R appuser:appuser /app /opt/playwright
 USER appuser
 
-# The loop writes a fresh predictions CSV every cycle; the probe checks that
-# heartbeat. start-period covers the first (slow) capture + prediction run.
-HEALTHCHECK --interval=2m --timeout=15s --start-period=15m --retries=3 \
+# The loop refreshes /app/.heartbeat every ~60s (including while waiting for the
+# next scheduled capture); the probe checks that file's freshness + the process.
+# The heartbeat appears within seconds of startup, so start-period is short.
+HEALTHCHECK --interval=1m --timeout=10s --start-period=90s --retries=3 \
     CMD ["docker-healthcheck"]
 
 # SIGTERM (docker stop) terminates the loop; compose runs tini as PID 1 via

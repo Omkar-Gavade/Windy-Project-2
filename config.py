@@ -47,10 +47,34 @@ RECORD_ANIMATION_VIDEO = True
 ANIMATION_LAYER = "satellite"
 ANIMATION_RECORD_SECONDS = 20
 
+# How long to keep recording after Play is clicked. Windy's nowcast buffers for
+# a long, variable time before it actually animates, so we record generously and
+# then trim to the moving window (see _trim_to_motion) rather than a fixed
+# offset. Must comfortably exceed ANIMATION_RECORD_SECONDS plus that warm-up.
+POST_PLAY_CAPTURE_SECONDS = 55
+
+# A recording is retried up to this many times if the captured clip is frozen /
+# static. If all attempts fail the run uploads nothing.
+RECORD_MAX_ATTEMPTS = 2
+
+# ---- Capture schedule (Asia/Kolkata) ----
+# The pipeline runs ONLY at these local times, every day -- never on a fixed
+# interval. Timezone-aware scheduling; no cron, no external scheduler.
+TIMEZONE = "Asia/Kolkata"
+CAPTURE_TIMES = [
+    (6, 45),
+    (8, 15),
+    (9, 45),
+    (11, 15),
+    (12, 45),
+    (14, 15),
+    (15, 45),
+]
+
 # ---- Forecast settings ----
 NUM_FORECAST_BLOCKS = 8       # 8 x 15 min = next 2 hours
 BLOCK_MINUTES = 15
-RUN_INTERVAL_SECONDS = 20 * 60
+RUN_INTERVAL_SECONDS = 20 * 60  # retained for reference; scheduler uses CAPTURE_TIMES
 
 # ---- Paths ----
 STORAGE_STATE_PATH = Path("windy_login.json")
@@ -65,3 +89,10 @@ for _dir in (SCREENSHOT_DIR, VIDEO_DIR, PREDICTIONS_DIR, FEATURES_LOG_DIR, MODEL
     _dir.mkdir(parents=True, exist_ok=True)
 
 MODEL_PATH = MODELS_DIR / "generation_model.pkl"
+
+# Liveness heartbeat: the main loop refreshes this file's mtime continuously
+# (including while waiting for the next scheduled capture). The Docker
+# healthcheck reads it, so container health reflects "the loop is ticking"
+# rather than "a prediction happened recently" -- correct given long gaps
+# between scheduled captures (and the ~15h overnight gap).
+HEARTBEAT_PATH = Path(".heartbeat")

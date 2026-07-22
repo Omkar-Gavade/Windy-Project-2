@@ -1,37 +1,36 @@
 #!/usr/bin/env bash
 # Container health probe.
 #
-# This application exposes no HTTP endpoint — it is a batch loop. So health is
-# defined by its actual work product: the pipeline rewrites
-# energy_predictions/<PLANT>_energy_generation.csv on every cycle, so a recent
-# mtime on that file proves capture -> feature extraction -> prediction -> write
-# all completed. A stale file means the loop is wedged even if the process is up.
+# The app now captures only at fixed times (see CAPTURE_TIMES in config.py),
+# with gaps up to ~15h overnight. So "a predictions CSV was written recently"
+# is NO LONGER a valid health signal -- it would report UNHEALTHY for most of
+# the day. Instead the main loop refreshes a heartbeat file every
+# HEARTBEAT_INTERVAL_SECONDS (60s), including while waiting for the next
+# scheduled capture. Health = the loop process is alive AND the heartbeat is
+# fresh. This reflects "the scheduler is ticking", independent of the schedule.
 set -euo pipefail
 
-PRED_DIR="${PRED_DIR:-/app/energy_predictions}"
+HEARTBEAT_FILE="${HEARTBEAT_FILE:-/app/.heartbeat}"
 
-# Allow ~2 cycles plus margin before declaring the loop unhealthy.
-# RUN_INTERVAL_SECONDS in config.py is 1200 (20 min), so the default is 45 min.
-MAX_AGE="${HEALTH_MAX_AGE_SECONDS:-2700}"
+# Max heartbeat age before unhealthy. The loop ticks every 60s, so 300s (5 min)
+# tolerates a slow capture cycle without false alarms.
+MAX_AGE="${HEALTH_MAX_AGE_SECONDS:-300}"
 
 # 1. The main loop process must be alive.
 pgrep -f "test_multi_image.py" >/dev/null 2>&1 \
     || { echo "UNHEALTHY: test_multi_image.py is not running"; exit 1; }
 
-# 2. A predictions CSV must exist and be recent.
-newest="$(find "$PRED_DIR" -name '*_energy_generation.csv' -type f -printf '%T@ %p\n' 2>/dev/null \
-          | sort -rn | head -1 | cut -d' ' -f2- || true)"
-
-if [ -z "$newest" ]; then
-    echo "UNHEALTHY: no *_energy_generation.csv found in $PRED_DIR"
+# 2. The heartbeat file must exist and be recent.
+if [ ! -f "$HEARTBEAT_FILE" ]; then
+    echo "UNHEALTHY: heartbeat file $HEARTBEAT_FILE not found (loop not started?)"
     exit 1
 fi
 
-age=$(( $(date +%s) - $(stat -c %Y "$newest") ))
+age=$(( $(date +%s) - $(stat -c %Y "$HEARTBEAT_FILE") ))
 if [ "$age" -gt "$MAX_AGE" ]; then
-    echo "UNHEALTHY: $(basename "$newest") is ${age}s old (limit ${MAX_AGE}s) — loop appears stalled"
+    echo "UNHEALTHY: heartbeat is ${age}s old (limit ${MAX_AGE}s) -- loop appears stalled"
     exit 1
 fi
 
-echo "healthy: $(basename "$newest") updated ${age}s ago"
+echo "healthy: heartbeat updated ${age}s ago"
 exit 0
